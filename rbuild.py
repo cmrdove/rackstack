@@ -4,7 +4,18 @@ import argparse
 import subprocess
 import os
 import sys
+import multiprocessing
 
+class printFormatting:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    END = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
 # Function to check if the binary exists
 def binary_exists(path):
@@ -20,7 +31,6 @@ if os.name == "posix":
     else:  # Assume Linux if not macOS
         print("Operating System: Linux")
         PATH_TO_OPENSCAD = '/usr/bin/openscad'
-        
         if binary_exists(PATH_TO_OPENSCAD):
             print(f"Binary found at {PATH_TO_OPENSCAD}")
         else:
@@ -28,7 +38,7 @@ if os.name == "posix":
 
         POSSIBLE_PATH_LOCATIONS_FOR_OPENSCAD_NIGHTLY = [
             '/snap/bin/openscad-nightly', #Path when installed using the snap tooling
-            '/usr/bin/openscad-nightly' #Path when installed using apt (also used in dockerfile)
+            '/usr/bin/openscad-nightly'#Path when installed using apt (also used in dockerfile)
         ]
 
         PATH_TO_OPENSCAD_NIGHTLY = ''
@@ -43,7 +53,6 @@ if os.name == "posix":
 elif os.name == "nt":  # Windows
     print("Operating System: Windows")
     PATH_TO_OPENSCAD = r'C:\Program Files\OpenSCAD\openscad.exe'
-    
     if binary_exists(PATH_TO_OPENSCAD):
         print(f"Binary found at {PATH_TO_OPENSCAD}")
     else:
@@ -150,6 +159,14 @@ def main():
         help='Generate the GIFS for the assembly guide, as well as various rack-mount systems.'
     )
 
+    parser.add_argument(
+        '--build_count',
+        default=0,
+        help='The pool size used for processing, if not supplied or equals 0 the CPU core count will be used',
+        type=int,
+        choices=range(1,100)
+    )
+
     args = parser.parse_args()
     run_build(args)
 
@@ -161,75 +178,110 @@ def run_build(args):
     dz = args.dz
     nightly = args.nightly
     build_gifs = args.build_gifs
+    build_count = args.build_count
+    if build_count <= 0:
+        build_count = multiprocessing.cpu_count() - 1
 
-    if (build_var is not None) == (build_gifs is True):
-        print("Please either provide the build (-b) variable, or the build-gifs option (--build-gifs)")
-        return
+    print(f'using {printFormatting.UNDERLINE}{build_count}{printFormatting.END} processes to build')
 
-    if build_gifs:
-        build_assembly_gifs(config_var, dz, nightly)
-        build_rack_mount_gifs(config_var, nightly)
-        return
+    pool = multiprocessing.Pool(processes=build_count)
+    try:
+        if (build_var is not None) == (build_gifs is True):
+            print(
+                "Please either provide the build (-b) variable, or the build-gifs option (--build-gifs)")
+            return
 
-    if target_var != "":
-        final_target_directory_name = target_var
-    else:
-        final_target_directory_name = config_var
+        if build_gifs:
+            build_all_gifs(config_var, dz, nightly, pool)
+        else:
+            if target_var != "":
+                final_target_directory_name = target_var
+            else:
+                final_target_directory_name = config_var
 
-    rackBuildDirFull = os.path.join(BUILD_PARENT_DIR, final_target_directory_name, RACK_BUILD_TARGET_SUB_DIR)
+            rackBuildDirFull = os.path.join(BUILD_PARENT_DIR, final_target_directory_name, RACK_BUILD_TARGET_SUB_DIR)
 
-    if not os.path.exists(rackBuildDirFull):
-        os.makedirs(rackBuildDirFull)
+            if not os.path.exists(rackBuildDirFull):
+                os.makedirs(rackBuildDirFull)
 
-    if build_var == 'all':
-        for dir_file in os.listdir(RACK_BUILD_DIR):
-            build_single(RACK_BUILD_DIR, rackBuildDirFull, dir_file, config_var, dz, nightly)
+            if build_var == 'all':
+                build_all(rackBuildDirFull, config_var, dz, nightly, pool)
+            else:
+                build_single_piece(build_var, rackBuildDirFull, config_var, dz, nightly, pool)
 
-        return
+        pool.close()
+    except KeyboardInterrupt:
+        pool.terminate()
+    
+    pool.join()
 
-    filename_rack = find_rack(build_var)
+
+def build_all(rackBuildDirFull, config_var, dz, nightly, pool):
+    for dir_file in os.listdir(RACK_BUILD_DIR):
+        pool.apply_async(build_single, args=(
+            RACK_BUILD_DIR, rackBuildDirFull, dir_file, config_var, dz, nightly))
+
+
+def build_single_piece(piece_to_build, rackBuildDirFull, config_var, dz, nightly, pool):
+    filename_rack = find_rack(piece_to_build)
 
     if not (filename_rack):
-        print('File:', build_var, 'not found!')
+        print(f'File: {piece_to_build} not found!')
         return
 
     if filename_rack:
-        build_single(RACK_BUILD_DIR, rackBuildDirFull, filename_rack, config_var, dz, nightly)
+        pool.apply_async(build_single, args=(RACK_BUILD_DIR, rackBuildDirFull,
+                                             filename_rack, config_var, dz, nightly))
+
+def build_all_gifs(config_var, dz, nightly, pool):
+    build_assembly_gifs(config_var, dz, nightly, pool)
+    build_rack_mount_gifs(config_var, nightly, pool)
+
 
 def build_single(build_dir, target_dir, filename, config, dz, nightly):
-    print('Building:', filename, 'from', build_dir, 'to', target_dir)
+    print(f'Building: {filename} from {build_dir} to {target_dir}')
     openscad_args = construct_openscad_args(build_dir, target_dir, filename, config, dz)
     run_openscad(openscad_args, nightly)
 
 
-def build_assembly_gifs(config, dz, nightly):
-    print('Building assembly-gifs. Source Dir:', ASSEMBLY_GIF_DIR, '| Target:', ASSEMBLY_GIF_BUILD_DIR)
+def build_assembly_gifs(config, dz, nightly, pool):
+    print(f'{printFormatting.HEADER}Building assembly-gifs. Source Dir: {printFormatting.END}{ASSEMBLY_GIF_DIR} {printFormatting.HEADER}| Target: {printFormatting.END}{ASSEMBLY_GIF_BUILD_DIR}')
 
     if not os.path.exists(ASSEMBLY_GIF_TEMP_DIR):
         os.makedirs(ASSEMBLY_GIF_TEMP_DIR)
 
     for (fileName, numSteps) in ASSEMBLY_STEPS:
-        print('Building GIF for', fileName)
-        openscad_args = construct_openscad_animation_args(
-            ASSEMBLY_GIF_DIR, ASSEMBLY_GIF_TEMP_DIR, fileName, config, dz, numSteps
-        )
-        run_openscad(openscad_args, nightly)
-        build_gif_from_png(fileName, ASSEMBLY_GIF_TEMP_DIR, ASSEMBLY_GIF_BUILD_DIR)
+        pool.apply_async(build_assembly_gif, args=(
+            config, dz, nightly, fileName, numSteps))
 
-def build_rack_mount_gifs(config, nightly):
-    print('Building GIFs for rack-mounts systems')
+def build_assembly_gif(config, dz, nightly, fileName, numSteps):
+    print(f'Building GIF for {printFormatting.OKGREEN}{fileName}{printFormatting.END}')
+    openscad_args = construct_openscad_animation_args(
+        ASSEMBLY_GIF_DIR, ASSEMBLY_GIF_TEMP_DIR, fileName, config, dz, numSteps
+    )
+    run_openscad(openscad_args, nightly)
+    build_gif_from_png(fileName, ASSEMBLY_GIF_TEMP_DIR, ASSEMBLY_GIF_BUILD_DIR)
+    print(f'{printFormatting.OKGREEN}Finished building GIF for {fileName}{printFormatting.END}')
+
+def build_rack_mount_gifs(config, nightly, pool):
+    print(f'{printFormatting.HEADER}Building GIFs for rack-mounts systems{printFormatting.END}')
 
     for (system, numSteps) in MOUNT_ANIMATIONS:
-        print('Building GIF for', system)
-        system_dir = os.path.join(RACK_MOUNT_DIR, system)
-        temp_dir = os.path.join(system_dir, 'tmp')
+        pool.apply_async(build_rack_mount_gif, args=(
+            config, nightly, system, numSteps))
 
-        if not os.path.exists(temp_dir):
-            os.makedirs(temp_dir)
+def build_rack_mount_gif(config, nightly, system, numSteps):
+    print(f'Building GIF for {printFormatting.OKBLUE}{system}{printFormatting.END}')
+    system_dir = os.path.join(RACK_MOUNT_DIR, system)
+    temp_dir = os.path.join(system_dir, 'tmp')
 
-        openscad_args = construct_openscad_animation_args(system_dir, temp_dir, 'animate.scad', config, 10, numSteps)
-        run_openscad(openscad_args, nightly)
-        build_gif_from_png('animate', temp_dir, system_dir)
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir)
+
+    openscad_args = construct_openscad_animation_args(system_dir, temp_dir, 'animate.scad', config, 10, numSteps)
+    run_openscad(openscad_args, nightly)
+    build_gif_from_png('animate', temp_dir, system_dir)
+    print(f'{printFormatting.OKBLUE}Finished building GIF for {system}{printFormatting.END}')
 
 def build_gif_from_png(fileName, source, target):
 
